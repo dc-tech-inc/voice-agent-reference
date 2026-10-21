@@ -1,7 +1,7 @@
 import type { Logger } from "../log.js";
 import { SAMPLE_RATE, type AudioChunk, type ProviderEvent, type VoiceProvider } from "../provider/types.js";
 import type { ToolRegistry } from "../tools/registry.js";
-import { connectWithFailover, DEFAULT_POLICY, withTimeout, type FailoverPolicy } from "./failover.js";
+import { connectWithFailover, resolvePolicy, withTimeout, type FailoverPolicy } from "./failover.js";
 import { transition, type SessionEvent, type SessionState } from "./state-machine.js";
 
 export type SessionOutput =
@@ -44,7 +44,7 @@ export class CallSession {
 
   constructor(private readonly opts: CallSessionOptions) {
     if (opts.providers.length === 0) throw new Error("at least one provider is required");
-    this.policy = { ...DEFAULT_POLICY, ...opts.policy };
+    this.policy = resolvePolicy(opts.policy);
     this.random = opts.random ?? Math.random;
     this.logger = opts.logger.child({ component: "call-session" });
   }
@@ -105,6 +105,11 @@ export class CallSession {
     this.emit({ type: "state", from, to, ...(provider && { provider }), ...(reason && { reason }) });
   }
 
+  /** Runs work started from an event handler or timer; a failure is logged, never an unhandled rejection. */
+  private background(work: Promise<void>, message: string): void {
+    work.catch((err: unknown) => this.logger.error({ err }, message));
+  }
+
   private emit(output: SessionOutput): void {
     for (const listener of this.listeners) listener(output);
   }
@@ -126,7 +131,11 @@ export class CallSession {
           this.apply({ type: "provider_failed", provider: provider.name, reason: `${error.code}: ${error.message}` });
         },
       });
-      if (this.stateValue === "ended") return;
+      if (this.stateValue === "ended") {
+        // hangup() landed while this connect was succeeding: do not leave that provider connected.
+        if (index !== undefined) await withTimeout(this.opts.providers[index]!.close(), 2000, undefined);
+        return;
+      }
       if (index === undefined) {
         this.apply({ type: "providers_exhausted" });
         await this.teardown();
@@ -144,6 +153,8 @@ export class CallSession {
     const unsubscribe = provider.on((e) => this.onProviderEvent(provider, e));
     this.current = { index, provider, unsubscribe };
     this.apply({ type: "provider_ready", provider: provider.name });
+    // A state listener may have hung up during apply(); teardown already ran.
+    if (this.stateValue !== "active") return;
     this.flushBuffer(provider);
     this.startHealthChecks();
   }
@@ -157,10 +168,15 @@ export class CallSession {
   }
 
   private flushBuffer(provider: VoiceProvider): void {
+    const chunks = this.buffer;
+    this.clearBuffer();
+    for (const chunk of chunks) provider.sendAudio(chunk);
+  }
+
+  private clearBuffer(): void {
     if (this.droppedBytes > 0) {
       this.logger.warn({ droppedMs: Math.round(this.droppedBytes / BYTES_PER_MS) }, "dropped caller audio while degraded");
     }
-    for (const chunk of this.buffer) provider.sendAudio(chunk);
     this.buffer = [];
     this.bufferedBytes = 0;
     this.droppedBytes = 0;
@@ -168,7 +184,7 @@ export class CallSession {
 
   private startHealthChecks(): void {
     clearInterval(this.healthTimer);
-    this.healthTimer = setInterval(() => void this.checkHealth(), this.policy.healthIntervalMs);
+    this.healthTimer = setInterval(() => this.background(this.checkHealth(), "health check failed"), this.policy.healthIntervalMs);
   }
 
   private async checkHealth(): Promise<void> {
@@ -193,14 +209,14 @@ export class CallSession {
         this.emit({ type: "transcript", role: event.role, text: event.text, final: event.final, provider: provider.name });
         return;
       case "tool_call":
-        void this.dispatchTool(provider, event.callId, event.name, event.argumentsJson);
+        this.background(this.dispatchTool(provider, event.callId, event.name, event.argumentsJson), "tool dispatch failed");
         return;
       case "error":
         // Every provider error is treated as fatal for this connection (see README, limitations).
-        void this.failActive(provider, `${event.code}: ${event.message}`, event.retryable);
+        this.background(this.failActive(provider, `${event.code}: ${event.message}`, event.retryable), "failover failed");
         return;
       case "closed":
-        void this.failActive(provider, event.reason, true);
+        this.background(this.failActive(provider, event.reason, true), "failover failed");
         return;
       case "ready":
         return;
@@ -237,8 +253,7 @@ export class CallSession {
   private async teardown(): Promise<void> {
     clearInterval(this.healthTimer);
     this.healthTimer = undefined;
-    this.buffer = [];
-    this.bufferedBytes = 0;
+    this.clearBuffer();
     await this.detachCurrent();
   }
 }

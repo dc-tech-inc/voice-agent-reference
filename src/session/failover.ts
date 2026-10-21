@@ -1,3 +1,4 @@
+import * as z from "zod";
 import { ProviderError, type ToolSpec, type VoiceProvider } from "../provider/types.js";
 
 export type FailoverPolicy = {
@@ -23,6 +24,26 @@ export const DEFAULT_POLICY: FailoverPolicy = {
   maxAttemptsPerProvider: 3,
   audioBufferMs: 2000,
 };
+
+const positiveMs = z.number().int().positive();
+const policySchema = z.object({
+  connectTimeoutMs: positiveMs,
+  healthIntervalMs: positiveMs,
+  healthTimeoutMs: positiveMs,
+  backoffBaseMs: z.number().int().nonnegative(),
+  backoffCapMs: z.number().int().nonnegative(),
+  maxAttemptsPerProvider: z.number().int().min(1),
+  audioBufferMs: z.number().int().nonnegative(),
+});
+
+/** Merges overrides into the defaults and validates the result. Throws naming the invalid fields. */
+export function resolvePolicy(overrides: Partial<FailoverPolicy> = {}): FailoverPolicy {
+  const parsed = policySchema.safeParse({ ...DEFAULT_POLICY, ...overrides });
+  if (!parsed.success) {
+    throw new Error(`invalid failover policy: ${parsed.error.issues.map((i) => i.path.join(".")).join(", ")}`);
+  }
+  return parsed.data;
+}
 
 /** Exponential backoff with full jitter: random in [0, min(cap, base * 2^(retry-1))). `retry` starts at 1. */
 export function backoffDelay(retry: number, policy: FailoverPolicy, random: () => number): number {

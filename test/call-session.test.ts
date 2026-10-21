@@ -153,3 +153,72 @@ describe("CallSession", () => {
     expect(outputs.length).toBe(before);
   });
 });
+
+describe("CallSession lifecycle edge cases", () => {
+  it("hangup from a state listener on 'active' leaves no timers running", async () => {
+    vi.useFakeTimers();
+    const p = new FakeProvider("p");
+    const { session } = setup([p]);
+    session.on((o) => {
+      if (o.type === "state" && o.to === "active") void session.hangup("caller already gone");
+    });
+    await session.start();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(session.state).toBe("ended");
+    expect(p.closeCalls).toBe(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("never leaves a provider connected when hangup races a successful connect", async () => {
+    const leaks: number[] = [];
+    for (let ticks = 0; ticks < 30; ticks++) {
+      const p = new FakeProvider("p");
+      const { session } = setup([p]);
+      const started = session.start();
+      for (let i = 0; i < ticks; i++) await Promise.resolve();
+      await session.hangup();
+      await started;
+      if (p.isConnected) leaks.push(ticks);
+    }
+    expect(leaks).toEqual([]);
+  });
+
+  it("logs caller audio that was dropped when the call ends while degraded", async () => {
+    vi.useFakeTimers();
+    const { logger, lines } = memoryLogger("warn");
+    const a = new FakeProvider("a", { connectPlan: ["ok", "fail"] });
+    const b = new FakeProvider("b", { connectPlan: ["fail"] });
+    const session = new CallSession({ providers: [a, b], tools: new ToolRegistry([]), instructions: "", logger });
+    await session.start();
+    a.crash();
+    for (let i = 0; i < 30; i++) session.sendAudio({ pcm16: Buffer.alloc(4800), sampleRate: 24000 }); // 3 s
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(session.state).toBe("ended");
+    expect(lines.some((l) => l.includes("dropped caller audio"))).toBe(true);
+  });
+
+  it("rejects an invalid failover policy at construction", () => {
+    const make = (policy: object) => () =>
+      new CallSession({ providers: [new FakeProvider("p")], tools: new ToolRegistry([]), instructions: "", logger: silentLogger, policy });
+    expect(make({ maxAttemptsPerProvider: 0 })).toThrow(/invalid failover policy: maxAttemptsPerProvider/);
+    expect(make({ connectTimeoutMs: -1 })).toThrow(/connectTimeoutMs/);
+    expect(make({ backoffBaseMs: 0 })).not.toThrow();
+  });
+
+  it("logs instead of crashing when a provider throws while receiving a tool result", async () => {
+    const { logger, lines } = memoryLogger("error");
+    const p = new FakeProvider("p");
+    vi.spyOn(p, "sendToolResult").mockImplementation(() => {
+      throw new Error("socket write failed");
+    });
+    const session = new CallSession({
+      providers: [p],
+      tools: new ToolRegistry(appointmentTools(new InMemoryStore([]))),
+      instructions: "",
+      logger,
+    });
+    await session.start();
+    p.callTool("cancel_booking", { bookingId: "bk_1" });
+    await vi.waitFor(() => expect(lines.some((l) => l.includes("tool dispatch failed"))).toBe(true));
+  });
+});
