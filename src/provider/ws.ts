@@ -24,6 +24,7 @@ export interface WebSocketLike {
 
 export type WebSocketFactory = (url: string, headers: Record<string, string>) => WebSocketLike;
 
+export const CONNECTING = 0;
 export const OPEN = 1;
 
 export const defaultWebSocketFactory: WebSocketFactory = (url, headers) => new WebSocket(url, { headers });
@@ -66,22 +67,38 @@ export abstract class WsProvider implements VoiceProvider {
         reject(new ProviderError("CONNECT_ABORTED", "connect aborted", true));
         return;
       }
-      this.pendingConnect = { resolve, reject };
+      // A provider instance is reused across reconnects: drop whatever socket it had before.
+      this.closeSocket();
       this.logger.debug({ provider: this.name, url: this.url() }, "connecting");
       const ws = this.socketFactory(this.url(), this.headers());
       this.socket = ws;
+      // Events from a replaced socket (e.g. its close handshake finishing late) must not be
+      // attributed to the current one.
+      const current = () => this.socket === ws;
 
-      cfg.signal.addEventListener(
-        "abort",
-        () => {
-          this.failConnect(new ProviderError("CONNECT_ABORTED", "connect aborted", true));
-          ws.close();
+      const onAbort = () => {
+        if (!current()) return;
+        this.failConnect(new ProviderError("CONNECT_ABORTED", "connect aborted", true));
+        this.closeSocket();
+      };
+      cfg.signal.addEventListener("abort", onAbort, { once: true });
+      const settled = () => cfg.signal.removeEventListener("abort", onAbort);
+      this.pendingConnect = {
+        resolve: () => {
+          settled();
+          resolve();
         },
-        { once: true },
-      );
+        reject: (err) => {
+          settled();
+          reject(err);
+        },
+      };
 
-      ws.on("open", () => this.handleOpen(cfg));
+      ws.on("open", () => {
+        if (current()) this.handleOpen(cfg);
+      });
       ws.on("message", (data, isBinary) => {
+        if (!current()) return;
         if (isBinary) {
           this.handleBinary(data);
           return;
@@ -95,13 +112,18 @@ export abstract class WsProvider implements VoiceProvider {
         }
         if (parsed && typeof parsed === "object") this.handleText(parsed as Record<string, unknown>);
       });
-      ws.on("pong", () => this.resolvePongs(true));
+      ws.on("pong", () => {
+        if (current()) this.resolvePongs(true);
+      });
       ws.on("error", (err) => {
+        if (!current()) return;
         // The handshake failing (DNS, TLS, HTTP 401/403) surfaces here before "open".
         if (this.failConnect(new ProviderError("SOCKET_ERROR", err.message, !/\b40[13]\b/.test(err.message)))) return;
         this.emit({ type: "error", code: "SOCKET_ERROR", message: err.message, retryable: true });
       });
       ws.on("close", (code, reason) => {
+        if (!current()) return;
+        this.socket = undefined;
         this.handleClosed();
         this.resolvePongs(false);
         const text = `socket closed (${code}${reason.length ? `: ${reason.toString("utf8")}` : ""})`;
@@ -121,11 +143,21 @@ export abstract class WsProvider implements VoiceProvider {
   }
 
   async close(): Promise<void> {
+    this.closeSocket();
+  }
+
+  /**
+   * Detaches the current socket first, so its late events are ignored, then starts the close
+   * handshake (or aborts the opening handshake). A pending connect is rejected.
+   */
+  private closeSocket(): void {
     const ws = this.socket;
+    if (!ws) return;
     this.socket = undefined;
     this.handleClosed();
     this.resolvePongs(false);
-    if (ws && ws.readyState === OPEN) ws.close(1000, "session ended");
+    this.failConnect(new ProviderError("CONNECT_ABORTED", "closed by client", true));
+    if (ws.readyState === CONNECTING || ws.readyState === OPEN) ws.close(1000, "session ended");
   }
 
   on(listener: ProviderListener): () => void {
