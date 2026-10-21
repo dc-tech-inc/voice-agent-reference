@@ -128,6 +128,29 @@ describe("OpenAIRealtimeProvider", () => {
     expect(err).toMatchObject({ code: "SOCKET_ERROR", retryable: false });
   });
 
+  it("rejects and closes the socket when the connect is aborted (timeout)", async () => {
+    const { factory, sockets } = fakeSocketFactory();
+    const { logger } = memoryLogger();
+    const provider = new OpenAIRealtimeProvider({ apiKey: KEY, model: "m", logger, socketFactory: factory });
+    const ac = new AbortController();
+    const pending = provider.connect({ instructions: "", tools: [], signal: ac.signal });
+    sockets[0]!.open();
+    ac.abort();
+    await expect(pending).rejects.toMatchObject({ code: "CONNECT_ABORTED" });
+    expect(sockets[0]!.readyState).toBe(3);
+    await expect(provider.connect({ instructions: "", tools: [], signal: ac.signal })).rejects.toMatchObject({
+      code: "CONNECT_ABORTED",
+    });
+  });
+
+  it("drops outbound frames when the socket is not open", async () => {
+    const { provider, socket } = await connected();
+    await provider.close();
+    const before = socket.sent.length;
+    provider.sendAudio({ pcm16: Buffer.from([1]), sampleRate: 24000 });
+    expect(socket.sent.length).toBe(before);
+  });
+
   it("emits closed when the socket drops after ready", async () => {
     const { socket, events } = await connected();
     socket.close(1006, "gone");

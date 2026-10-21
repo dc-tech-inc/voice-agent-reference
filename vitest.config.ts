@@ -8,6 +8,8 @@ export default defineConfig({
       include: ["src/**/*.ts"],
       exclude: ["src/demo/**", "src/index.ts"],
       reporter: ["text", "json-summary"],
+      // Guard rails, set a little below the measured numbers so a real regression fails CI.
+      thresholds: { lines: 90, branches: 80 },
     },
   },
 });
