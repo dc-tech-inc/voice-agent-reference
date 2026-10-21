@@ -125,3 +125,25 @@ describe("ToolRegistry failure handling", () => {
     expect(() => new ToolRegistry([t, t])).toThrow(/duplicate/);
   });
 });
+
+describe("ToolRegistry edge cases", () => {
+  it("returns TOOL_FAILED for a result that cannot be serialized to JSON", async () => {
+    const reg = new ToolRegistry([
+      defineTool({ name: "lookup", description: "", input: z.object({}), handler: async () => ({ ok: true, id: 1n }) }),
+    ]);
+    expect(await reg.execute("lookup", "{}")).toEqual({ ok: false, error: "TOOL_FAILED" });
+  });
+
+  it("supports schemas with async refinements", async () => {
+    const reg = new ToolRegistry([
+      defineTool({
+        name: "lookup",
+        description: "",
+        input: z.object({ id: z.string().refine(async (v) => v !== "taken", { error: "id is taken" }) }),
+        handler: async () => ({ ok: true }),
+      }),
+    ]);
+    expect(await reg.execute("lookup", '{"id":"x"}')).toEqual({ ok: true });
+    expect(await reg.execute("lookup", '{"id":"taken"}')).toMatchObject({ ok: false, error: "VALIDATION_ERROR" });
+  });
+});

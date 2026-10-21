@@ -58,21 +58,24 @@ export class ToolRegistry {
       } satisfies ToolFailure;
     }
 
-    const parsed = tool.input.safeParse(raw);
-    if (!parsed.success) {
-      return {
-        ok: false,
-        error: "VALIDATION_ERROR",
-        issues: parsed.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
-      } satisfies ToolFailure;
-    }
-
     let timer: NodeJS.Timeout | undefined;
     const timeout = new Promise<ToolFailure>((resolve) => {
       timer = setTimeout(() => resolve({ ok: false, error: "TOOL_TIMEOUT" }), this.timeoutMs);
     });
     try {
-      return await Promise.race([tool.handler(parsed.data), timeout]);
+      // Async so schemas with async refinements work; inside the try because a refinement can throw.
+      const parsed = await tool.input.safeParseAsync(raw);
+      if (!parsed.success) {
+        return {
+          ok: false,
+          error: "VALIDATION_ERROR",
+          issues: parsed.error.issues.map((i) => ({ path: i.path.join("."), message: i.message })),
+        } satisfies ToolFailure;
+      }
+      const result = await Promise.race([tool.handler(parsed.data), timeout]);
+      // Adapters serialize the result with JSON.stringify; fail here (e.g. BigInt) rather than in the adapter.
+      JSON.stringify(result);
+      return result;
     } catch {
       return { ok: false, error: "TOOL_FAILED" } satisfies ToolFailure;
     } finally {
