@@ -5,7 +5,7 @@ import { CallSession, type SessionOutput } from "../src/session/call-session.js"
 import { appointmentTools } from "../src/tools/appointment-tools.js";
 import { defineTool, ToolRegistry } from "../src/tools/registry.js";
 import { InMemoryStore, seedSlots } from "../src/tools/store.js";
-import { silentLogger } from "./helpers.js";
+import { memoryLogger, silentLogger } from "./helpers.js";
 
 function setup(providers = [new FakeProvider("primary"), new FakeProvider("fallback")], registry?: ToolRegistry) {
   const store = new InMemoryStore(seedSlots(["2026-11-02"], ["room-a"], [9, 10]));
@@ -85,6 +85,32 @@ describe("CallSession", () => {
     expect(session.activeProvider).toBe("fallback");
     expect(primary.toolResults).toEqual([]);
     expect(fallback.toolResults).toEqual([]);
+  });
+
+  it("drops a tool result issued on the previous connection of the same provider", async () => {
+    vi.useFakeTimers();
+    const { logger, lines } = memoryLogger("warn");
+    const slow = new ToolRegistry([
+      defineTool({
+        name: "slow",
+        description: "",
+        input: z.object({}),
+        handler: () => new Promise((resolve) => setTimeout(() => resolve({ ok: true }), 1000)),
+      }),
+    ]);
+    const only = new FakeProvider("only"); // e.g. only OPENAI_API_KEY is set
+    const session = new CallSession({ providers: [only], tools: slow, instructions: "", logger });
+    await session.start();
+
+    only.callTool("slow", {}, "call_from_connection_1");
+    only.crash("socket closed (1006)");
+    await vi.advanceTimersByTimeAsync(0);
+    expect(session.activeProvider).toBe("only");
+    expect(only.connectAttempts).toBe(2);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(only.toolResults).toEqual([]);
+    expect(lines.some((l) => l.includes("dropping tool result"))).toBe(true);
   });
 
   it("hangup ends the call, closes the provider and ignores later audio", async () => {

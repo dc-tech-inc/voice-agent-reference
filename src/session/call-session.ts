@@ -221,9 +221,12 @@ export class CallSession {
   }
 
   private async dispatchTool(provider: VoiceProvider, callId: string, name: string, argumentsJson: string): Promise<void> {
+    // `current` is a new object on every attach, so this identifies the connection, not just the
+    // provider: a reconnect to the same provider must not receive a result for a call it never made.
+    const connection = this.current;
     const result = await this.opts.tools.execute(name, argumentsJson);
-    if (this.current?.provider !== provider || this.stateValue !== "active") {
-      this.logger.warn({ provider: provider.name, tool: name, callId }, "dropping tool result: provider no longer active");
+    if (this.current !== connection || this.stateValue !== "active") {
+      this.logger.warn({ provider: provider.name, tool: name, callId }, "dropping tool result: connection no longer active");
       return;
     }
     this.logger.info({ provider: provider.name, tool: name, callId }, "tool call completed");
