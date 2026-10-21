@@ -91,7 +91,8 @@ the diagram throws `InvalidTransitionError`, and the tests check both the valid 
 
 On a mid-call failure the session tries the *other* providers first and the one that just failed
 last. A provider that failed with a non-retryable error (rejected key, rejected configuration) is
-not tried again for the rest of the call.
+not tried again for the rest of the call. The policy is validated when the session is created
+(for example, `maxAttemptsPerProvider` must be at least 1).
 
 ## Failure modes handled
 
@@ -105,10 +106,10 @@ not tried again for the rest of the call.
 | Every provider exhausted | Failover loop runs out | `degraded → ended`, providers closed | `failover.test.ts` |
 | Model sends malformed or invalid tool arguments | zod `safeParse` | `{ ok: false, error: "VALIDATION_ERROR", issues }` returned to the model; handler not run, store unchanged | `tools.test.ts`, `call-session.test.ts` |
 | Model calls a tool that does not exist | Registry lookup | `{ ok: false, error: "UNKNOWN_TOOL" }` | `tools.test.ts` |
-| Tool handler hangs or throws | 3 s timeout / catch | `TOOL_TIMEOUT` / `TOOL_FAILED` returned to the model | `tools.test.ts` |
+| Tool handler hangs, throws, or returns a value JSON cannot serialize | 3 s timeout / catch / serialization check | `TOOL_TIMEOUT` / `TOOL_FAILED` returned to the model | `tools.test.ts` |
 | Double booking | Store check | `{ ok: false, error: "SLOT_TAKEN" }` | `tools.test.ts` |
-| Provider fails while a tool is running | Session checks the active provider before replying | Result dropped (logged) instead of sent to a dead or different session | `call-session.test.ts` |
-| Late events from a provider that was replaced | Listener removed on failover | Ignored | `call-session.test.ts` |
+| Connection fails while a tool is running, including a reconnect to the same provider | Each tool call is bound to the connection it arrived on | Result dropped (logged) instead of sent to a connection that never made the call | `call-session.test.ts` |
+| Late events from a replaced provider, or from the replaced socket of the same provider (e.g. a close handshake finishing after the reconnect) | Listener removed on failover; every socket handler checks that its socket is still current | Ignored | `call-session.test.ts`, `stale-socket.test.ts` |
 | Deepgram cancels a function call | `FunctionCallCancelled` | No `FunctionCallResponse` is sent for that id | `deepgram-mapping.test.ts` |
 | SIGINT / SIGTERM | Signal handler | Hang up, close providers, flush logs, exit 0 (exit 1 if not done within 5 s) | `shutdown.test.ts` |
 
@@ -164,7 +165,7 @@ Copy `.env.example` to `.env` (never commit it) and set the keys you have:
 | `LOG_LEVEL` | pino level, default `info` |
 
 There is no audio I/O in this repo, so using the real providers means wiring the session into your
-own audio source (a telephony media stream, a WebRTC server, a file):
+own audio source (a telephony media stream, a WebRTC server, a file). Run this from the repo root:
 
 ```ts
 import { CallSession, ToolRegistry, appointmentTools, InMemoryStore, seedSlots,
@@ -198,9 +199,9 @@ pnpm build
 pnpm test --coverage
 ```
 
-All tests are offline and deterministic (fake timers, injected random, fake WebSocket). Measured on
-2026-10-21: **82 tests in 7 files, all passing; coverage 98.5% lines, 96.4% statements, 95.7%
-functions, 84.5% branches** (`@vitest/coverage-v8`, demo and barrel file excluded). CI fails below
+All tests are offline: fake timers, injected random and a fake WebSocket, plus a few reconnect
+scenarios against a real `ws` server on 127.0.0.1. Measured on 2026-10-21: **96 tests in 8 files, all passing; coverage
+98.8% lines, 96.8% statements, 97.3% functions, 84.6% branches** (`@vitest/coverage-v8`, demo and barrel file excluded). CI fails below
 90% lines or 80% branches.
 
 | Test file | Covers |
@@ -210,7 +211,8 @@ functions, 84.5% branches** (`@vitest/coverage-v8`, demo and barrel file exclude
 | `tools.test.ts` | Booking, double booking, cancel, validation errors, unknown tool, handler timeout and exceptions, JSON Schema output |
 | `openai-mapping.test.ts` | URL and auth header, `session.update`, event mapping, outbound frames, error classification, abort, key never logged |
 | `deepgram-mapping.test.ts` | URL and auth header, `Settings` after `Welcome`, `SettingsApplied`, event mapping, `KeepAlive`, cancelled calls, health check, key never logged |
-| `call-session.test.ts` | Tool round-trip end to end, validation through the session, stale tool results, hangup, late events |
+| `call-session.test.ts` | Tool round-trip end to end, validation through the session, stale tool results (other provider and same provider reconnected), hangup races, late events, policy validation |
+| `stale-socket.test.ts` | Events from a replaced socket are ignored after a reconnect (fake socket and real `ws` server) |
 | `shutdown.test.ts` | SIGTERM/SIGINT handling and exit codes, env config parsing |
 
 CI (`.github/workflows/ci.yml`, Node 24 on Ubuntu) runs lint, typecheck, build, tests with
@@ -240,8 +242,13 @@ used in CI.
   failover. Some provider errors (for example a rejected client event) are recoverable; a production
   system would classify them more finely.
 - User-side transcripts from OpenAI only arrive if input transcription is enabled in the session
-  configuration. The adapter maps those events but does not enable transcription, because that
-  needs a transcription model choice this repo does not make.
+  configuration (`session.audio.input.transcription`). The adapter maps those events but does not
+  enable transcription, because that needs a transcription model choice this repo does not make.
+- The attempt budget (3 per provider) applies per failover episode. A provider that keeps
+  accepting the connection and dropping it right away is redialled each time without backoff;
+  a production system should add a per-call budget or count short-lived connections as failures.
+- A tool handler that hits the 3 s timeout keeps running in the background; only its result is
+  discarded. Handlers with side effects should be cancellable or idempotent.
 - The connect timeout, health checks and backoff are tested with fake timers, not against real
   network conditions.
 - Deepgram's `listen`/`think`/`speak` models default to the values in Deepgram's docs examples
@@ -253,10 +260,11 @@ Consulted on 2026-10-21. The OpenAI and Deepgram protocol pages were re-read whi
 
 - OpenAI Realtime API, WebSocket guide: https://developers.openai.com/api/docs/guides/realtime-websocket
 - OpenAI Realtime overview: https://developers.openai.com/api/docs/guides/realtime
-- OpenAI Realtime conversations (session.update, audio formats, function calling flow): https://developers.openai.com/api/docs/guides/realtime-conversations
-- OpenAI Realtime server events reference: https://developers.openai.com/api/reference/resources/realtime/server-events
+- OpenAI Realtime conversations (session.update, audio formats, returning function results): https://developers.openai.com/api/docs/guides/realtime-conversations
+- OpenAI Realtime server events reference (including `response.function_call_arguments.done`): https://developers.openai.com/api/reference/resources/realtime/server-events
 - Deepgram Voice Agent API reference: https://developers.deepgram.com/reference/voice-agent/voice-agent.md
 - Deepgram authentication (`Authorization: Token`): https://developers.deepgram.com/guides/fundamentals/authenticating.md
+- Deepgram token-based auth (`Token` for API keys vs `Bearer` for temporary tokens): https://developers.deepgram.com/guides/fundamentals/token-based-authentication
 - Deepgram voice agent JavaScript guide (Welcome then Settings, KeepAlive every 5 s): https://developers.deepgram.com/docs/build-a-voice-agent-javascript.md
 - ws: https://github.com/websockets/ws
 - zod 4 and JSON Schema output: https://zod.dev/ and https://zod.dev/json-schema
