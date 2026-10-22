@@ -200,8 +200,8 @@ pnpm test --coverage
 ```
 
 All tests are offline: fake timers, injected random and a fake WebSocket, plus a few reconnect
-scenarios against a real `ws` server on 127.0.0.1. Measured on 2026-10-21: **96 tests in 8 files, all passing; coverage
-98.8% lines, 96.8% statements, 97.3% functions, 84.6% branches** (`@vitest/coverage-v8`, demo and barrel file excluded). CI fails below
+scenarios against a real `ws` server on 127.0.0.1. Measured on 2026-10-21: 96 tests in 8 files, all passing; coverage
+98.8% lines, 96.8% statements, 97.3% functions, 84.6% branches (`@vitest/coverage-v8`, demo and barrel file excluded). CI fails below
 90% lines or 80% branches.
 
 | Test file | Covers |
@@ -235,7 +235,7 @@ used in CI.
   deployment needs consent, retention rules, and log scrubbing beyond the auth-header redaction here.
 - **Time zones and business rules**: slots are UTC and every seeded slot is bookable.
 
-## Honest limitations
+## Limitations
 
 - The two real adapters are **untested against the live APIs** (see above).
 - Every `error` event from a provider is treated as fatal for that connection and triggers
